@@ -244,6 +244,7 @@ func getHexoToHugoKeyMap() map[string]string {
 		"permalink":   "slug",
 		"tags":        "tags",
 		"updated":     "lastmod",
+		"sticky":      "weight",
 	}
 }
 

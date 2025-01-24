@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1](https://github.com/pplmx/h2h/compare/v0.1.0..v0.1.1) - 2025-01-23
+
+### 🚀 Features
+
+- *(convert)* Add support for Hexo sticky posts - ([d826ff3](https://github.com/pplmx/h2h/commit/d826ff3dbe9cc6d57e786624c402de5d98255eed))
+
+## New Contributors ❤️
+
+* @github-actions[bot] made their first contribution
+
 ## [0.1.0] - 2024-10-20
 
 ### 🚀 Features

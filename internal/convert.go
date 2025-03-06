@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,10 +11,17 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
+)
+
+// Errors
+var (
+	ErrInvalidMarkdownFormat = errors.New("invalid markdown format: missing front matter delimiters")
+	ErrUnsupportedFormat     = errors.New("unsupported front matter format")
 )
 
 // Config holds the configuration for the conversion process
@@ -34,6 +42,23 @@ func NewDefaultConfig() *Config {
 		MaxConcurrency:      4,
 		ConversionDirection: "hexo2hugo",
 	}
+}
+
+// Validate checks if the configuration is valid
+func (c *Config) Validate() error {
+	// Validate formats
+	for _, format := range []string{c.SourceFormat, c.TargetFormat} {
+		if format != "yaml" && format != "toml" {
+			return fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
+		}
+	}
+
+	// Validate conversion direction
+	if c.ConversionDirection != "hexo2hugo" && c.ConversionDirection != "hugo2hexo" {
+		return fmt.Errorf("invalid conversion direction: %s", c.ConversionDirection)
+	}
+
+	return nil
 }
 
 // FrontMatterConverter handles the conversion of front matter
@@ -61,11 +86,14 @@ func NewFrontMatterConverter(cfg *Config) *FrontMatterConverter {
 
 // ConvertFrontMatter converts the front matter from source format to target format
 func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string, error) {
+	frontMatter = strings.TrimSpace(frontMatter)
+
 	var frontMatterMap map[string]interface{}
 	if err := unmarshalFrontMatter(fmc.sourceFormat, []byte(frontMatter), &frontMatterMap); err != nil {
 		return "", fmt.Errorf("unmarshaling front matter: %w", err)
 	}
 
+	// Pre-allocate with the same size for efficiency
 	convertedMap := make(map[string]interface{}, len(frontMatterMap))
 	for key, value := range frontMatterMap {
 		if convertedKey, ok := fmc.keyMap[key]; ok {
@@ -76,6 +104,8 @@ func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string,
 	}
 
 	var buf bytes.Buffer
+	buf.Grow(len(frontMatter) + 100) // Pre-allocate buffer with estimated size
+
 	if err := marshalFrontMatter(fmc.targetFormat, &buf, convertedMap); err != nil {
 		return "", fmt.Errorf("marshaling front matter: %w", err)
 	}
@@ -95,23 +125,51 @@ func NewMarkdownConverter(cfg *Config) *MarkdownConverter {
 
 // ConvertMarkdown converts a single markdown file
 func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
-	content, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("reading content: %w", err)
+	// Use buffered reader for better performance
+	br := bufio.NewReader(r)
+
+	// Read the first delimiter
+	firstLine, err := br.ReadString('\n')
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(firstLine), "---") {
+		return ErrInvalidMarkdownFormat
 	}
 
-	parts := strings.SplitN(string(content), "---", 3)
-	if len(parts) < 3 {
-		return errors.New("parsing content: invalid hexo/hugo markdown format")
+	// Read the front matter content
+	var frontMatter strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("reading front matter: %w", err)
+		}
+
+		if strings.HasPrefix(strings.TrimSpace(line), "---") {
+			break
+		}
+
+		frontMatter.WriteString(line)
+
+		if err == io.EOF {
+			return ErrInvalidMarkdownFormat
+		}
 	}
 
-	convertedFrontMatter, err := mc.fmc.ConvertFrontMatter(parts[1])
+	// Convert the front matter
+	convertedFrontMatter, err := mc.fmc.ConvertFrontMatter(frontMatter.String())
 	if err != nil {
 		return fmt.Errorf("converting front matter: %w", err)
 	}
 
-	_, err = fmt.Fprintf(w, "%s\n\n%s", convertedFrontMatter, parts[2])
-	return err
+	// Write the converted front matter
+	if _, err := fmt.Fprintf(w, "%s\n\n", convertedFrontMatter); err != nil {
+		return fmt.Errorf("writing front matter: %w", err)
+	}
+
+	// Copy the rest of the content
+	if _, err := io.Copy(w, br); err != nil {
+		return fmt.Errorf("writing content: %w", err)
+	}
+
+	return nil
 }
 
 // ConversionError represents an error that occurred during the conversion process
@@ -124,56 +182,124 @@ func (e *ConversionError) Error() string {
 	return fmt.Sprintf("converting file %s: %v", e.SourceFile, e.Err)
 }
 
+// ConversionStats tracks statistics about the conversion process
+type ConversionStats struct {
+	FilesProcessed uint64
+	FilesConverted uint64
+	Errors         []*ConversionError
+	mu             sync.Mutex
+}
+
+// AddError adds an error to the statistics
+func (s *ConversionStats) AddError(err *ConversionError) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Errors = append(s.Errors, err)
+}
+
+// FileProcessed increments the count of processed files
+func (s *ConversionStats) FileProcessed() {
+	atomic.AddUint64(&s.FilesProcessed, 1)
+}
+
+// FileConverted increments the count of successfully converted files
+func (s *ConversionStats) FileConverted() {
+	atomic.AddUint64(&s.FilesConverted, 1)
+}
+
+// PrintSummary prints a summary of the conversion process
+func (s *ConversionStats) PrintSummary() {
+	fmt.Printf("Files processed: %d\n", s.FilesProcessed)
+	fmt.Printf("Files successfully converted: %d\n", s.FilesConverted)
+
+	if len(s.Errors) > 0 {
+		fmt.Printf("Errors occurred during conversion: %d\n", len(s.Errors))
+		for _, err := range s.Errors {
+			fmt.Printf("- %v\n", err)
+		}
+	}
+}
+
 // ConvertPosts converts all markdown posts in the source directory to the target format
 func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
+	// Validate the configuration
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	// Ensure destination directory exists
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("creating destination directory %s: %w", dstDir, err)
 	}
 
 	mc := NewMarkdownConverter(cfg)
-
-	var mu sync.Mutex
-	var conversionErrors []*ConversionError
+	stats := &ConversionStats{}
 
 	g, ctx := errgroup.WithContext(context.Background())
 	g.SetLimit(cfg.MaxConcurrency)
 
-	err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(info.Name(), cfg.FileExtension) {
-			return err
-		}
+	fileListChan := make(chan string, 100) // Buffer channel to improve performance
 
-		relPath, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return fmt.Errorf("getting relative path: %w", err)
-		}
-		dstPath := filepath.Join(dstDir, relPath)
+	// Start a goroutine to walk the directory and send files to the channel
+	g.Go(func() error {
+		defer close(fileListChan)
 
+		return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if info.IsDir() || !strings.HasSuffix(info.Name(), cfg.FileExtension) {
+				return nil
+			}
+
+			select {
+			case fileListChan <- path:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	})
+
+	// Start worker goroutines to process files
+	for i := 0; i < cfg.MaxConcurrency; i++ {
 		g.Go(func() error {
-			if err := convertFile(ctx, mc, path, dstPath); err != nil {
-				mu.Lock()
-				conversionErrors = append(conversionErrors, &ConversionError{SourceFile: path, Err: err})
-				mu.Unlock()
+			for srcPath := range fileListChan {
+				stats.FileProcessed()
+
+				relPath, err := filepath.Rel(srcDir, srcPath)
+				if err != nil {
+					stats.AddError(&ConversionError{SourceFile: srcPath, Err: fmt.Errorf("getting relative path: %w", err)})
+					continue
+				}
+
+				dstPath := filepath.Join(dstDir, relPath)
+
+				if err := convertFile(ctx, mc, srcPath, dstPath); err != nil {
+					stats.AddError(&ConversionError{SourceFile: srcPath, Err: err})
+				} else {
+					stats.FileConverted()
+				}
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
 			}
 			return nil
 		})
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("walking source directory %s: %w", srcDir, err)
 	}
 
 	if err := g.Wait(); err != nil {
 		return err
 	}
 
-	if len(conversionErrors) > 0 {
-		for _, err := range conversionErrors {
-			fmt.Printf("Error: %v\n", err)
-		}
-		return fmt.Errorf("encountered %d errors during conversion", len(conversionErrors))
+	stats.PrintSummary()
+
+	if len(stats.Errors) > 0 {
+		return fmt.Errorf("encountered %d errors during conversion", len(stats.Errors))
 	}
 
 	return nil
@@ -200,11 +326,23 @@ func convertFile(ctx context.Context, mc *MarkdownConverter, srcPath, dstPath st
 	if err != nil {
 		return fmt.Errorf("creating destination file: %w", err)
 	}
-	defer dstFile.Close()
 
-	if err := mc.ConvertMarkdown(srcFile, dstFile); err != nil {
-		os.Remove(dstPath)
+	// Use buffered writer for better performance
+	bw := bufio.NewWriter(dstFile)
+
+	err = mc.ConvertMarkdown(srcFile, bw)
+	if flushErr := bw.Flush(); flushErr != nil && err == nil {
+		err = fmt.Errorf("flushing output: %w", flushErr)
+	}
+
+	closeErr := dstFile.Close()
+	if err != nil {
+		os.Remove(dstPath) // Clean up on conversion error
 		return fmt.Errorf("converting file: %w", err)
+	}
+
+	if closeErr != nil {
+		return fmt.Errorf("closing destination file: %w", closeErr)
 	}
 
 	return nil
@@ -217,7 +355,7 @@ func unmarshalFrontMatter(format string, data []byte, v interface{}) error {
 	case "toml":
 		return toml.Unmarshal(data, v)
 	default:
-		return fmt.Errorf("unsupported front matter format: %s", format)
+		return fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
 }
 
@@ -226,11 +364,12 @@ func marshalFrontMatter(format string, w io.Writer, v interface{}) error {
 	case "yaml":
 		encoder := yaml.NewEncoder(w)
 		encoder.SetIndent(4)
+		defer encoder.Close() // Properly close encoder
 		return encoder.Encode(v)
 	case "toml":
 		return toml.NewEncoder(w).Encode(v)
 	default:
-		return fmt.Errorf("unsupported front matter format: %s", format)
+		return fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
 }
 
@@ -249,6 +388,7 @@ func getHexoToHugoKeyMap() map[string]string {
 }
 
 func getHugoToHexoKeyMap() map[string]string {
+	// Invert the hexo to hugo map
 	hexoToHugo := getHexoToHugoKeyMap()
 	hugoToHexo := make(map[string]string, len(hexoToHugo))
 	for hexo, hugo := range hexoToHugo {

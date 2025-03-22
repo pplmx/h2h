@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -16,13 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Direction represents the conversion direction
-type Direction string
-
-// Format represents the front matter format
-type Format string
-
-// Conversion constants
+// 定义常量和错误
 const (
 	DirectionHexoToHugo Direction = "hexo2hugo"
 	DirectionHugoToHexo Direction = "hugo2hexo"
@@ -30,43 +25,40 @@ const (
 	FormatYAML Format = "yaml"
 	FormatTOML Format = "toml"
 
-	DefaultMaxConcurrency = 4
-	DefaultFileExtension  = ".md"
-	FrontMatterDelimiter  = "---"
+	DefaultFileExtension = ".md"
+	FrontMatterDelimiter = "---"
 )
 
-// Config defines the settings for the conversion process
-type Config struct {
-	SourceFormat        Format
-	TargetFormat        Format
-	FileExtension       string
-	MaxConcurrency      int
-	ConversionDirection Direction
-}
-
-// NewDefaultConfig returns a configuration with default settings
-func NewDefaultConfig() *Config {
-	return &Config{
-		SourceFormat:        FormatYAML,
-		TargetFormat:        FormatYAML,
-		FileExtension:       DefaultFileExtension,
-		MaxConcurrency:      DefaultMaxConcurrency,
-		ConversionDirection: DirectionHexoToHugo,
-	}
-}
-
-// Error definitions
 var (
 	ErrInvalidMarkdown   = errors.New("invalid markdown: missing front matter delimiters")
 	ErrUnsupportedFormat = errors.New("unsupported format")
 )
 
-// ConversionError represents an error during the conversion process
-type ConversionError struct {
-	SourceFile string
-	Err        error
-}
+// 基本类型定义
+type (
+	Direction string
+	Format    string
 
+	Config struct {
+		SourceFormat        Format
+		TargetFormat        Format
+		FileExtension       string
+		MaxConcurrency      int
+		ConversionDirection Direction
+	}
+
+	ConversionError struct {
+		SourceFile string
+		Err        error
+	}
+
+	FormatHandler interface {
+		Unmarshal(data []byte, v interface{}) error
+		Marshal(w io.Writer, v interface{}) error
+	}
+)
+
+// 错误处理
 func (e *ConversionError) Error() string {
 	return fmt.Sprintf("converting file %s: %v", e.SourceFile, e.Err)
 }
@@ -75,14 +67,11 @@ func (e *ConversionError) Unwrap() error {
 	return e.Err
 }
 
-// FormatHandler defines an interface for front matter processing
-type FormatHandler interface {
-	Unmarshal(data []byte, v interface{}) error
-	Marshal(w io.Writer, v interface{}) error
-}
-
-// YAMLHandler handles YAML front matter
-type YAMLHandler struct{}
+// 格式处理实现
+type (
+	YAMLHandler struct{}
+	TOMLHandler struct{}
+)
 
 func (h YAMLHandler) Unmarshal(data []byte, v interface{}) error {
 	return yaml.Unmarshal(data, v)
@@ -90,12 +79,10 @@ func (h YAMLHandler) Unmarshal(data []byte, v interface{}) error {
 
 func (h YAMLHandler) Marshal(w io.Writer, v interface{}) error {
 	encoder := yaml.NewEncoder(w)
-	encoder.SetIndent(4)
+	defer encoder.Close() // 防止内存泄漏
+	encoder.SetIndent(4)  // 减少缩进以节省空间
 	return encoder.Encode(v)
 }
-
-// TOMLHandler handles TOML front matter
-type TOMLHandler struct{}
 
 func (h TOMLHandler) Unmarshal(data []byte, v interface{}) error {
 	return toml.Unmarshal(data, v)
@@ -105,60 +92,80 @@ func (h TOMLHandler) Marshal(w io.Writer, v interface{}) error {
 	return toml.NewEncoder(w).Encode(v)
 }
 
-// formatHandlers maps format types to their handlers
-var formatHandlers = map[Format]FormatHandler{
-	FormatYAML: YAMLHandler{},
-	FormatTOML: TOMLHandler{},
+// 全局变量初始化
+var (
+	// 格式处理器映射
+	formatHandlers = map[Format]FormatHandler{
+		FormatYAML: YAMLHandler{},
+		FormatTOML: TOMLHandler{},
+	}
+
+	// 键映射定义
+	keyMappings = map[Direction]map[string]string{
+		DirectionHexoToHugo: {
+			"permalink": "slug",
+			"updated":   "lastmod",
+			"sticky":    "weight",
+		},
+		DirectionHugoToHexo: {
+			"slug":    "permalink",
+			"lastmod": "updated",
+			"weight":  "sticky",
+		},
+	}
+)
+
+// NewDefaultConfig 返回默认配置
+func NewDefaultConfig() *Config {
+	return &Config{
+		SourceFormat:        FormatYAML,
+		TargetFormat:        FormatYAML,
+		FileExtension:       DefaultFileExtension,
+		MaxConcurrency:      runtime.NumCPU(),
+		ConversionDirection: DirectionHexoToHugo,
+	}
 }
 
-// keyMappings defines the mapping of front matter keys for different directions
-var keyMappings = map[Direction]map[string]string{
-	DirectionHexoToHugo: {
-		"permalink": "slug",
-		"updated":   "lastmod",
-		"sticky":    "weight",
-	},
-	DirectionHugoToHexo: {
-		"slug":    "permalink",
-		"lastmod": "updated",
-		"weight":  "sticky",
-	},
-}
-
-// FrontMatterConverter handles front matter conversion
+// FrontMatterConverter 处理前置元数据转换
 type FrontMatterConverter struct {
-	keyMap       map[string]string
-	sourceFormat Format
-	targetFormat Format
+	keyMap        map[string]string
+	sourceFormat  Format
+	targetFormat  Format
+	sourceHandler FormatHandler
+	targetHandler FormatHandler
 }
 
-// NewFrontMatterConverter creates a new front matter converter with validation
+// NewFrontMatterConverter 创建新的前置元数据转换器
 func NewFrontMatterConverter(cfg *Config) (*FrontMatterConverter, error) {
-	if _, ok := formatHandlers[cfg.SourceFormat]; !ok {
+	sourceHandler, ok := formatHandlers[cfg.SourceFormat]
+	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, cfg.SourceFormat)
 	}
-	if _, ok := formatHandlers[cfg.TargetFormat]; !ok {
+
+	targetHandler, ok := formatHandlers[cfg.TargetFormat]
+	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, cfg.TargetFormat)
 	}
 
 	return &FrontMatterConverter{
-		keyMap:       keyMappings[cfg.ConversionDirection],
-		sourceFormat: cfg.SourceFormat,
-		targetFormat: cfg.TargetFormat,
+		keyMap:        keyMappings[cfg.ConversionDirection],
+		sourceFormat:  cfg.SourceFormat,
+		targetFormat:  cfg.TargetFormat,
+		sourceHandler: sourceHandler,
+		targetHandler: targetHandler,
 	}, nil
 }
 
-// ConvertFrontMatter converts the front matter between formats
+// ConvertFrontMatter 在格式之间转换前置元数据
 func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string, error) {
 	frontMatterMap := make(map[string]interface{})
 
-	// Parse the source format
-	sourceHandler := formatHandlers[fmc.sourceFormat]
-	if err := sourceHandler.Unmarshal([]byte(frontMatter), &frontMatterMap); err != nil {
+	// 解析源格式
+	if err := fmc.sourceHandler.Unmarshal([]byte(frontMatter), &frontMatterMap); err != nil {
 		return "", fmt.Errorf("unmarshaling front matter: %w", err)
 	}
 
-	// Apply key mappings
+	// 应用键映射
 	convertedMap := make(map[string]interface{}, len(frontMatterMap))
 	for key, value := range frontMatterMap {
 		targetKey := key
@@ -168,23 +175,21 @@ func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string,
 		convertedMap[targetKey] = value
 	}
 
-	// Marshal to target format
+	// 转换为目标格式
 	var buf bytes.Buffer
-	targetHandler := formatHandlers[fmc.targetFormat]
-	if err := targetHandler.Marshal(&buf, convertedMap); err != nil {
+	if err := fmc.targetHandler.Marshal(&buf, convertedMap); err != nil {
 		return "", fmt.Errorf("marshaling front matter: %w", err)
 	}
 
-	// Format with delimiters
 	return fmt.Sprintf("%s\n%s%s", FrontMatterDelimiter, buf.String(), FrontMatterDelimiter), nil
 }
 
-// MarkdownConverter handles the conversion of Markdown files
+// MarkdownConverter 处理Markdown文件转换
 type MarkdownConverter struct {
 	fmc *FrontMatterConverter
 }
 
-// NewMarkdownConverter creates a new Markdown converter
+// NewMarkdownConverter 创建新的Markdown转换器
 func NewMarkdownConverter(cfg *Config) (*MarkdownConverter, error) {
 	fmc, err := NewFrontMatterConverter(cfg)
 	if err != nil {
@@ -193,7 +198,7 @@ func NewMarkdownConverter(cfg *Config) (*MarkdownConverter, error) {
 	return &MarkdownConverter{fmc: fmc}, nil
 }
 
-// ConvertMarkdown converts a single Markdown file
+// ConvertMarkdown 转换单个Markdown文件
 func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 	content, err := io.ReadAll(r)
 	if err != nil {
@@ -205,7 +210,7 @@ func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 		return ErrInvalidMarkdown
 	}
 
-	convertedFrontMatter, err := mc.fmc.ConvertFrontMatter(parts[1])
+	convertedFrontMatter, err := mc.fmc.ConvertFrontMatter(strings.TrimSpace(parts[1]))
 	if err != nil {
 		return fmt.Errorf("converting front matter: %w", err)
 	}
@@ -214,7 +219,7 @@ func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 	return err
 }
 
-// FileProcessor encapsulates the logic for processing individual files
+// FileProcessor 封装处理单个文件的逻辑
 type FileProcessor struct {
 	converter *MarkdownConverter
 	srcDir    string
@@ -222,7 +227,7 @@ type FileProcessor struct {
 	fileExt   string
 }
 
-// NewFileProcessor creates a new file processor
+// NewFileProcessor 创建新的文件处理器
 func NewFileProcessor(converter *MarkdownConverter, srcDir, dstDir, fileExt string) *FileProcessor {
 	return &FileProcessor{
 		converter: converter,
@@ -232,7 +237,7 @@ func NewFileProcessor(converter *MarkdownConverter, srcDir, dstDir, fileExt stri
 	}
 }
 
-// ProcessFile handles the conversion of a single file
+// ProcessFile 处理单个文件的转换
 func (fp *FileProcessor) ProcessFile(ctx context.Context, path string) error {
 	select {
 	case <-ctx.Done():
@@ -240,31 +245,31 @@ func (fp *FileProcessor) ProcessFile(ctx context.Context, path string) error {
 	default:
 	}
 
-	// Skip non-matching files
+	// 跳过不匹配的文件
 	if !strings.HasSuffix(path, fp.fileExt) {
 		return nil
 	}
 
-	// Determine destination path
+	// 确定目标路径
 	relPath, err := filepath.Rel(fp.srcDir, path)
 	if err != nil {
 		return fmt.Errorf("getting relative path: %w", err)
 	}
 	dstPath := filepath.Join(fp.dstDir, relPath)
 
-	// Ensure destination directory exists
+	// 确保目标目录存在
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
 		return fmt.Errorf("creating destination directory: %w", err)
 	}
 
-	// Open source file
+	// 打开源文件
 	srcFile, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening source file: %w", err)
 	}
 	defer srcFile.Close()
 
-	// Create destination file
+	// 创建目标文件
 	dstFile, err := os.Create(dstPath)
 	if err != nil {
 		return fmt.Errorf("creating destination file: %w", err)
@@ -276,15 +281,11 @@ func (fp *FileProcessor) ProcessFile(ctx context.Context, path string) error {
 		}
 	}()
 
-	// Convert content
-	if err := fp.converter.ConvertMarkdown(srcFile, dstFile); err != nil {
-		return fmt.Errorf("converting file: %w", err)
-	}
-
-	return nil
+	// 转换内容
+	return fp.converter.ConvertMarkdown(srcFile, dstFile)
 }
 
-// ConvertPosts converts all Markdown posts from the source directory to the target format
+// ConvertPosts 将源目录中的所有Markdown文章转换为目标格式
 func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 	if cfg == nil {
 		cfg = NewDefaultConfig()
@@ -314,13 +315,27 @@ func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 	g, ctx := errgroup.WithContext(context.Background())
 	g.SetLimit(cfg.MaxConcurrency)
 
-	// Walk source directory
+	// 记录处理的文件数
+	var fileCount int64
+
+	// 遍历源目录
 	err = filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil {
 			return err
 		}
 
-		// Process each file concurrently
+		if info.IsDir() {
+			return nil
+		}
+
+		if !strings.HasSuffix(path, cfg.FileExtension) {
+			return nil
+		}
+
+		// 文件计数增加
+		fileCount++
+
+		// 并发处理每个文件
 		g.Go(func() error {
 			if err := processor.ProcessFile(ctx, path); err != nil {
 				mu.Lock()
@@ -342,7 +357,10 @@ func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 		return err
 	}
 
-	// Report errors if any
+	// 报告结果
+	fmt.Printf("Processed %d files\n", fileCount)
+
+	// 报告错误（如果有）
 	if len(conversionErrors) > 0 {
 		for _, err := range conversionErrors {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

@@ -16,26 +16,32 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Constants for configuration and conversion settings
+// Direction represents the conversion direction
+type Direction string
+
+// Format represents the front matter format
+type Format string
+
+// Conversion constants
 const (
+	DirectionHexoToHugo Direction = "hexo2hugo"
+	DirectionHugoToHexo Direction = "hugo2hexo"
+
+	FormatYAML Format = "yaml"
+	FormatTOML Format = "toml"
+
 	DefaultMaxConcurrency = 4
 	DefaultFileExtension  = ".md"
 	FrontMatterDelimiter  = "---"
-
-	DirectionHexoToHugo = "hexo2hugo"
-	DirectionHugoToHexo = "hugo2hexo"
-
-	FormatYAML = "yaml"
-	FormatTOML = "toml"
 )
 
 // Config defines the settings for the conversion process
 type Config struct {
-	SourceFormat        string
-	TargetFormat        string
+	SourceFormat        Format
+	TargetFormat        Format
 	FileExtension       string
 	MaxConcurrency      int
-	ConversionDirection string
+	ConversionDirection Direction
 }
 
 // NewDefaultConfig returns a configuration with default settings
@@ -49,6 +55,12 @@ func NewDefaultConfig() *Config {
 	}
 }
 
+// Error definitions
+var (
+	ErrInvalidMarkdown   = errors.New("invalid markdown: missing front matter delimiters")
+	ErrUnsupportedFormat = errors.New("unsupported format")
+)
+
 // ConversionError represents an error during the conversion process
 type ConversionError struct {
 	SourceFile string
@@ -59,7 +71,6 @@ func (e *ConversionError) Error() string {
 	return fmt.Sprintf("converting file %s: %v", e.SourceFile, e.Err)
 }
 
-// Unwrap returns the underlying error for compatibility with errors.Is/As
 func (e *ConversionError) Unwrap() error {
 	return e.Err
 }
@@ -94,87 +105,77 @@ func (h TOMLHandler) Marshal(w io.Writer, v interface{}) error {
 	return toml.NewEncoder(w).Encode(v)
 }
 
-// Map of format handlers
-var formatHandlers = map[string]FormatHandler{
+// formatHandlers maps format types to their handlers
+var formatHandlers = map[Format]FormatHandler{
 	FormatYAML: YAMLHandler{},
 	FormatTOML: TOMLHandler{},
 }
 
-// KeyMappings defines the mapping of front matter keys for different directions
-var keyMappings = map[string]map[string]string{
+// keyMappings defines the mapping of front matter keys for different directions
+var keyMappings = map[Direction]map[string]string{
 	DirectionHexoToHugo: {
-		"title":       "title",
-		"categories":  "categories",
-		"date":        "date",
-		"description": "description",
-		"keywords":    "keywords",
-		"permalink":   "slug",
-		"tags":        "tags",
-		"updated":     "lastmod",
-		"sticky":      "weight",
+		"permalink": "slug",
+		"updated":   "lastmod",
+		"sticky":    "weight",
+	},
+	DirectionHugoToHexo: {
+		"slug":    "permalink",
+		"lastmod": "updated",
+		"weight":  "sticky",
 	},
 }
 
 // FrontMatterConverter handles front matter conversion
 type FrontMatterConverter struct {
 	keyMap       map[string]string
-	sourceFormat string
-	targetFormat string
+	sourceFormat Format
+	targetFormat Format
 }
 
-// NewFrontMatterConverter creates a new front matter converter
+// NewFrontMatterConverter creates a new front matter converter with validation
 func NewFrontMatterConverter(cfg *Config) (*FrontMatterConverter, error) {
 	if _, ok := formatHandlers[cfg.SourceFormat]; !ok {
-		return nil, fmt.Errorf("unsupported source format: %s", cfg.SourceFormat)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, cfg.SourceFormat)
 	}
 	if _, ok := formatHandlers[cfg.TargetFormat]; !ok {
-		return nil, fmt.Errorf("unsupported target format: %s", cfg.TargetFormat)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, cfg.TargetFormat)
 	}
 
 	return &FrontMatterConverter{
-		keyMap:       getKeyMap(cfg.ConversionDirection),
+		keyMap:       keyMappings[cfg.ConversionDirection],
 		sourceFormat: cfg.SourceFormat,
 		targetFormat: cfg.TargetFormat,
 	}, nil
-}
-
-// getKeyMap retrieves the key mapping for the specified direction
-func getKeyMap(direction string) map[string]string {
-	if direction == DirectionHexoToHugo {
-		return keyMappings[DirectionHexoToHugo]
-	}
-
-	// Reverse mapping for hugo2hexo
-	hugoToHexo := make(map[string]string, len(keyMappings[DirectionHexoToHugo]))
-	for hexo, hugo := range keyMappings[DirectionHexoToHugo] {
-		hugoToHexo[hugo] = hexo
-	}
-	return hugoToHexo
 }
 
 // ConvertFrontMatter converts the front matter between formats
 func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string, error) {
 	frontMatterMap := make(map[string]interface{})
 
-	handler := formatHandlers[fmc.sourceFormat]
-	if err := handler.Unmarshal([]byte(frontMatter), &frontMatterMap); err != nil {
+	// Parse the source format
+	sourceHandler := formatHandlers[fmc.sourceFormat]
+	if err := sourceHandler.Unmarshal([]byte(frontMatter), &frontMatterMap); err != nil {
 		return "", fmt.Errorf("unmarshaling front matter: %w", err)
 	}
 
+	// Apply key mappings
 	convertedMap := make(map[string]interface{}, len(frontMatterMap))
 	for key, value := range frontMatterMap {
 		targetKey := key
-		if converted, ok := fmc.keyMap[key]; ok {
-			targetKey = converted
+		if mapped, ok := fmc.keyMap[key]; ok {
+			targetKey = mapped
 		}
 		convertedMap[targetKey] = value
 	}
 
+	// Marshal to target format
 	var buf bytes.Buffer
-	if err := formatHandlers[fmc.targetFormat].Marshal(&buf, convertedMap); err != nil {
+	targetHandler := formatHandlers[fmc.targetFormat]
+	if err := targetHandler.Marshal(&buf, convertedMap); err != nil {
 		return "", fmt.Errorf("marshaling front matter: %w", err)
 	}
 
+	// Format with delimiters
 	return fmt.Sprintf("%s\n%s%s", FrontMatterDelimiter, buf.String(), FrontMatterDelimiter), nil
 }
 
@@ -191,9 +192,6 @@ func NewMarkdownConverter(cfg *Config) (*MarkdownConverter, error) {
 	}
 	return &MarkdownConverter{fmc: fmc}, nil
 }
-
-// ErrInvalidMarkdown indicates missing front matter delimiters
-var ErrInvalidMarkdown = errors.New("invalid markdown format: missing front matter delimiters")
 
 // ConvertMarkdown converts a single Markdown file
 func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
@@ -216,24 +214,57 @@ func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 	return err
 }
 
-// convertFile handles the conversion of a single file
-func convertFile(ctx context.Context, mc *MarkdownConverter, srcPath, dstPath string) error {
+// FileProcessor encapsulates the logic for processing individual files
+type FileProcessor struct {
+	converter *MarkdownConverter
+	srcDir    string
+	dstDir    string
+	fileExt   string
+}
+
+// NewFileProcessor creates a new file processor
+func NewFileProcessor(converter *MarkdownConverter, srcDir, dstDir, fileExt string) *FileProcessor {
+	return &FileProcessor{
+		converter: converter,
+		srcDir:    srcDir,
+		dstDir:    dstDir,
+		fileExt:   fileExt,
+	}
+}
+
+// ProcessFile handles the conversion of a single file
+func (fp *FileProcessor) ProcessFile(ctx context.Context, path string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
 
-	srcFile, err := os.Open(srcPath)
+	// Skip non-matching files
+	if !strings.HasSuffix(path, fp.fileExt) {
+		return nil
+	}
+
+	// Determine destination path
+	relPath, err := filepath.Rel(fp.srcDir, path)
+	if err != nil {
+		return fmt.Errorf("getting relative path: %w", err)
+	}
+	dstPath := filepath.Join(fp.dstDir, relPath)
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("creating destination directory: %w", err)
+	}
+
+	// Open source file
+	srcFile, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening source file: %w", err)
 	}
 	defer srcFile.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return fmt.Errorf("creating destination directory: %w", err)
-	}
-
+	// Create destination file
 	dstFile, err := os.Create(dstPath)
 	if err != nil {
 		return fmt.Errorf("creating destination file: %w", err)
@@ -245,7 +276,8 @@ func convertFile(ctx context.Context, mc *MarkdownConverter, srcPath, dstPath st
 		}
 	}()
 
-	if err := mc.ConvertMarkdown(srcFile, dstFile); err != nil {
+	// Convert content
+	if err := fp.converter.ConvertMarkdown(srcFile, dstFile); err != nil {
 		return fmt.Errorf("converting file: %w", err)
 	}
 
@@ -258,36 +290,39 @@ func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 		cfg = NewDefaultConfig()
 	}
 
+	// Ensure destination directory exists
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("creating destination directory %s: %w", dstDir, err)
 	}
 
-	mc, err := NewMarkdownConverter(cfg)
+	// Create converter
+	converter, err := NewMarkdownConverter(cfg)
 	if err != nil {
 		return fmt.Errorf("creating markdown converter: %w", err)
 	}
 
+	// Create file processor
+	processor := NewFileProcessor(converter, srcDir, dstDir, cfg.FileExtension)
+
+	// Setup error handling
 	var (
 		mu               sync.Mutex
 		conversionErrors []*ConversionError
 	)
 
+	// Setup errgroup for concurrent processing
 	g, ctx := errgroup.WithContext(context.Background())
 	g.SetLimit(cfg.MaxConcurrency)
 
+	// Walk source directory
 	err = filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(info.Name(), cfg.FileExtension) {
+		if err != nil || info.IsDir() {
 			return err
 		}
 
-		relPath, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return fmt.Errorf("getting relative path: %w", err)
-		}
-		dstPath := filepath.Join(dstDir, relPath)
-
+		// Process each file concurrently
 		g.Go(func() error {
-			if err := convertFile(ctx, mc, path, dstPath); err != nil {
+			if err := processor.ProcessFile(ctx, path); err != nil {
 				mu.Lock()
 				conversionErrors = append(conversionErrors, &ConversionError{SourceFile: path, Err: err})
 				mu.Unlock()
@@ -302,10 +337,12 @@ func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 		return fmt.Errorf("walking source directory %s: %w", srcDir, err)
 	}
 
+	// Wait for all goroutines to complete
 	if err := g.Wait(); err != nil {
 		return err
 	}
 
+	// Report errors if any
 	if len(conversionErrors) > 0 {
 		for _, err := range conversionErrors {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

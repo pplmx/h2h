@@ -20,11 +20,20 @@ type TestFile struct {
 	Date       string
 	Tags       []string
 	Categories []string
+	// If RawContent is true then Content is taken as the full file content without adding front matter.
+	RawContent bool
 	Content    string // Additional content beyond the front matter and title
 }
 
-// GenerateContent creates the full file content including front matter
+// GenerateContent creates the full file content.
+// If RawContent is true, it returns Content as-is.
+// Otherwise, it generates a front matter block and appends Content.
 func (tf TestFile) GenerateContent() string {
+	// If RawContent is true, return Content exactly.
+	if tf.RawContent {
+		return tf.Content
+	}
+
 	var sb strings.Builder
 
 	// Front matter
@@ -42,8 +51,6 @@ func (tf TestFile) GenerateContent() string {
 
 	// Default content
 	sb.WriteString(fmt.Sprintf("# %s\n", tf.Title))
-
-	// If custom content is provided, use it; otherwise use default
 	if tf.Content != "" {
 		sb.WriteString(tf.Content)
 	} else {
@@ -103,11 +110,6 @@ func (env *TestEnvironment) Setup() *TestEnvironment {
 	return env
 }
 
-// RunConversion executes the conversion process
-func (env *TestEnvironment) RunConversion() error {
-	return internal.ConvertPosts(env.SrcDir, env.DstDir, env.Config)
-}
-
 // VerifyFile checks if a single file was converted properly
 func (env *TestEnvironment) VerifyFile(t *testing.T, fileName string, expectedContentSubstr string) {
 	t.Helper()
@@ -165,9 +167,11 @@ func TestConvertPosts(t *testing.T) {
 		{
 			name: "Invalid front matter",
 			setupEnv: func(env *TestEnvironment) {
+				// Mark RawContent true so that the provided content is written as-is.
 				env.AddFile(TestFile{
-					Name:    "invalid.md",
-					Content: "# Invalid Post\nThis is an invalid post without front matter.",
+					Name:       "invalid.md",
+					RawContent: true,
+					Content:    "# Invalid Post\nThis is an invalid post without front matter.",
 				})
 			},
 			expectError:  true,
@@ -180,7 +184,7 @@ func TestConvertPosts(t *testing.T) {
 		{
 			name: "Empty file",
 			setupEnv: func(env *TestEnvironment) {
-				env.AddFile(TestFile{Name: "empty.md"})
+				env.AddFile(TestFile{Name: "empty.md", RawContent: true, Content: ""})
 			},
 			expectError:  true,
 			errorMessage: "encountered 1 errors during conversion",
@@ -199,7 +203,7 @@ func TestConvertPosts(t *testing.T) {
 			env.Setup()
 
 			// Run the conversion
-			err := env.RunConversion()
+			err := internal.ConvertPosts(env.SrcDir, env.DstDir, env.Config)
 
 			// Verify results
 			tc.verify(t, env, err)
@@ -251,7 +255,7 @@ func TestEdgeCases(t *testing.T) {
 			}
 
 			env.Setup()
-			err := env.RunConversion()
+			err := internal.ConvertPosts(env.SrcDir, env.DstDir, env.Config)
 			tc.verify(t, env, err)
 		})
 	}
@@ -280,7 +284,7 @@ func TestConcurrency(t *testing.T) {
 			}
 			env.Setup()
 
-			err := env.RunConversion()
+			err := internal.ConvertPosts(env.SrcDir, env.DstDir, env.Config)
 			assert.NoError(t, err, "ConvertPosts failed with concurrency %d", concurrency)
 
 			for i := 0; i < fileCount; i++ {
@@ -317,7 +321,7 @@ func TestParallelConversions(t *testing.T) {
 			}
 			env.Setup()
 
-			err := env.RunConversion()
+			err := internal.ConvertPosts(env.SrcDir, env.DstDir, env.Config)
 			assert.NoError(t, err, "ConvertPosts failed for parallel environment %d", envNum)
 
 			// Verify in same goroutine to avoid race conditions

@@ -36,6 +36,82 @@ func NewDefaultConfig() *Config {
 	}
 }
 
+// ConversionError represents an error that occurred during the conversion process
+type ConversionError struct {
+	SourceFile string
+	Err        error
+}
+
+func (e *ConversionError) Error() string {
+	return fmt.Sprintf("converting file %s: %v", e.SourceFile, e.Err)
+}
+
+// Format handlers for marshaling and unmarshaling front matter
+var formatHandlers = map[string]struct {
+	unmarshal func([]byte, interface{}) error
+	marshal   func(io.Writer, interface{}) error
+}{
+	"yaml": {
+		unmarshal: yaml.Unmarshal,
+		marshal: func(w io.Writer, v interface{}) error {
+			encoder := yaml.NewEncoder(w)
+			encoder.SetIndent(4)
+			return encoder.Encode(v)
+		},
+	},
+	"toml": {
+		unmarshal: toml.Unmarshal,
+		marshal: func(w io.Writer, v interface{}) error {
+			return toml.NewEncoder(w).Encode(v)
+		},
+	},
+}
+
+// Key mapping functions
+var keyMaps = map[string]map[string]string{
+	"hexo2hugo": {
+		"title":       "title",
+		"categories":  "categories",
+		"date":        "date",
+		"description": "description",
+		"keywords":    "keywords",
+		"permalink":   "slug",
+		"tags":        "tags",
+		"updated":     "lastmod",
+		"sticky":      "weight",
+	},
+}
+
+// Helper functions for format handling and key mapping
+func unmarshalFrontMatter(format string, data []byte, v interface{}) error {
+	handler, ok := formatHandlers[format]
+	if !ok {
+		return fmt.Errorf("unsupported front matter format: %s", format)
+	}
+	return handler.unmarshal(data, v)
+}
+
+func marshalFrontMatter(format string, w io.Writer, v interface{}) error {
+	handler, ok := formatHandlers[format]
+	if !ok {
+		return fmt.Errorf("unsupported front matter format: %s", format)
+	}
+	return handler.marshal(w, v)
+}
+
+func getKeyMap(direction string) map[string]string {
+	if direction == "hexo2hugo" {
+		return keyMaps["hexo2hugo"]
+	}
+
+	// For hugo2hexo, invert the hexo2hugo map
+	hugoToHexo := make(map[string]string, len(keyMaps["hexo2hugo"]))
+	for hexo, hugo := range keyMaps["hexo2hugo"] {
+		hugoToHexo[hugo] = hexo
+	}
+	return hugoToHexo
+}
+
 // FrontMatterConverter handles the conversion of front matter
 type FrontMatterConverter struct {
 	keyMap       map[string]string
@@ -45,12 +121,7 @@ type FrontMatterConverter struct {
 
 // NewFrontMatterConverter creates a new FrontMatterConverter
 func NewFrontMatterConverter(cfg *Config) *FrontMatterConverter {
-	var keyMap map[string]string
-	if cfg.ConversionDirection == "hexo2hugo" {
-		keyMap = getHexoToHugoKeyMap()
-	} else {
-		keyMap = getHugoToHexoKeyMap()
-	}
+	keyMap := getKeyMap(cfg.ConversionDirection)
 
 	return &FrontMatterConverter{
 		keyMap:       keyMap,
@@ -68,11 +139,11 @@ func (fmc *FrontMatterConverter) ConvertFrontMatter(frontMatter string) (string,
 
 	convertedMap := make(map[string]interface{}, len(frontMatterMap))
 	for key, value := range frontMatterMap {
-		if convertedKey, ok := fmc.keyMap[key]; ok {
-			convertedMap[convertedKey] = value
-		} else {
-			convertedMap[key] = value
+		targetKey := key
+		if converted, ok := fmc.keyMap[key]; ok {
+			targetKey = converted
 		}
+		convertedMap[targetKey] = value
 	}
 
 	var buf bytes.Buffer
@@ -102,7 +173,7 @@ func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 
 	parts := strings.SplitN(string(content), "---", 3)
 	if len(parts) < 3 {
-		return errors.New("parsing content: invalid hexo/hugo markdown format")
+		return errors.New("invalid markdown format: missing front matter delimiters")
 	}
 
 	convertedFrontMatter, err := mc.fmc.ConvertFrontMatter(parts[1])
@@ -114,14 +185,36 @@ func (mc *MarkdownConverter) ConvertMarkdown(r io.Reader, w io.Writer) error {
 	return err
 }
 
-// ConversionError represents an error that occurred during the conversion process
-type ConversionError struct {
-	SourceFile string
-	Err        error
-}
+// File conversion functions
+func convertFile(ctx context.Context, mc *MarkdownConverter, srcPath, dstPath string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
-func (e *ConversionError) Error() string {
-	return fmt.Sprintf("converting file %s: %v", e.SourceFile, e.Err)
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("opening source file: %w", err)
+	}
+	defer srcFile.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("creating destination directory: %w", err)
+	}
+
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return fmt.Errorf("creating destination file: %w", err)
+	}
+	defer dstFile.Close()
+
+	if err := mc.ConvertMarkdown(srcFile, dstFile); err != nil {
+		os.Remove(dstPath)
+		return fmt.Errorf("converting file: %w", err)
+	}
+
+	return nil
 }
 
 // ConvertPosts converts all markdown posts in the source directory to the target format
@@ -177,82 +270,4 @@ func ConvertPosts(srcDir, dstDir string, cfg *Config) error {
 	}
 
 	return nil
-}
-
-func convertFile(ctx context.Context, mc *MarkdownConverter, srcPath, dstPath string) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	srcFile, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("opening source file: %w", err)
-	}
-	defer srcFile.Close()
-
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return fmt.Errorf("creating destination directory: %w", err)
-	}
-
-	dstFile, err := os.Create(dstPath)
-	if err != nil {
-		return fmt.Errorf("creating destination file: %w", err)
-	}
-	defer dstFile.Close()
-
-	if err := mc.ConvertMarkdown(srcFile, dstFile); err != nil {
-		os.Remove(dstPath)
-		return fmt.Errorf("converting file: %w", err)
-	}
-
-	return nil
-}
-
-func unmarshalFrontMatter(format string, data []byte, v interface{}) error {
-	switch format {
-	case "yaml":
-		return yaml.Unmarshal(data, v)
-	case "toml":
-		return toml.Unmarshal(data, v)
-	default:
-		return fmt.Errorf("unsupported front matter format: %s", format)
-	}
-}
-
-func marshalFrontMatter(format string, w io.Writer, v interface{}) error {
-	switch format {
-	case "yaml":
-		encoder := yaml.NewEncoder(w)
-		encoder.SetIndent(4)
-		return encoder.Encode(v)
-	case "toml":
-		return toml.NewEncoder(w).Encode(v)
-	default:
-		return fmt.Errorf("unsupported front matter format: %s", format)
-	}
-}
-
-func getHexoToHugoKeyMap() map[string]string {
-	return map[string]string{
-		"title":       "title",
-		"categories":  "categories",
-		"date":        "date",
-		"description": "description",
-		"keywords":    "keywords",
-		"permalink":   "slug",
-		"tags":        "tags",
-		"updated":     "lastmod",
-		"sticky":      "weight",
-	}
-}
-
-func getHugoToHexoKeyMap() map[string]string {
-	hexoToHugo := getHexoToHugoKeyMap()
-	hugoToHexo := make(map[string]string, len(hexoToHugo))
-	for hexo, hugo := range hexoToHugo {
-		hugoToHexo[hugo] = hexo
-	}
-	return hugoToHexo
 }

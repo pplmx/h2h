@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2](https://github.com/pplmx/h2h/compare/v0.1.1..v0.1.2) - 2025-03-22
+
+### 🚀 Features
+
+- *(convert)* Optimize file processing and error handling - ([527398d](https://github.com/pplmx/h2h/commit/527398d6333ef321b635c12cee01b57640c2e554))
+- *(convert)* Optimize and refactor the conversion process - ([5f96181](https://github.com/pplmx/h2h/commit/5f961811d32819eba1a6595a5cc343ec9996ff3e))
+
+### 🚜 Refactor
+
+- Improve code structure and readability - ([e8b5906](https://github.com/pplmx/h2h/commit/e8b5906d6279a4ef8960c724f2fd007ad5afb5bd))
+- Improve code structure and maintainability - ([8eadcd4](https://github.com/pplmx/h2h/commit/8eadcd48ff97c62f7e6d9c79cd816b0abeb87bec))
+- Reorganize and optimize conversion logic - ([abfa627](https://github.com/pplmx/h2h/commit/abfa62729fd73802e77f113bec44067907667e9d))
+
+### Build
+
+- *(deps)* Update the package - ([8234fd5](https://github.com/pplmx/h2h/commit/8234fd57dbf968881298a1956eec5df433694aac))
+
+
 ## [0.1.1](https://github.com/pplmx/h2h/compare/v0.1.0..v0.1.1) - 2025-01-23
 
 ### 🚀 Features
